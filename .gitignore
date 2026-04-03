@@ -51,8 +51,9 @@ htmlcov/
 .env.local
 *.env
 
-# Local data (entire folder and contents)
-Wireless/
+# Wireless: keep folder in repo; ignore large workbooks (place .xlsx files here locally)
+Wireless/*
+!Wireless/.gitkeep
 
 # Generated output (Excel exports; regenerate with scripts)
 output/
