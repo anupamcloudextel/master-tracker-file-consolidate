@@ -779,6 +779,17 @@ def main() -> None:
             all_df = insert_source_column(all_df, path)
         all_frames.append(all_df)
     merged_all = pd.concat(all_frames, ignore_index=True, sort=False)
+    gi_data_cols = [c for c in merged_all.columns if c != SOURCE_COLUMN]
+    merged_all = merged_all.dropna(subset=gi_data_cols, how="all")
+    merged_all = merged_all[
+        ~merged_all[gi_data_cols].apply(
+            lambda row: all(
+                (isinstance(v, str) and not v.strip()) or pd.isna(v)
+                for v in row
+            ),
+            axis=1,
+        )
+    ].reset_index(drop=True)
 
     first_columns = list(loaded[0][1].columns)
     common = set(first_columns)
@@ -813,6 +824,17 @@ def main() -> None:
             frames.append(df)
 
         merged = pd.concat(frames, ignore_index=True, sort=False)
+        gi_common_data_cols = [c for c in merged.columns if c != SOURCE_COLUMN]
+        merged = merged.dropna(subset=gi_common_data_cols, how="all")
+        merged = merged[
+            ~merged[gi_common_data_cols].apply(
+                lambda row: all(
+                    (isinstance(v, str) and not v.strip()) or pd.isna(v)
+                    for v in row
+                ),
+                axis=1,
+            )
+        ].reset_index(drop=True)
 
     if output_path.is_file():
         try:
