@@ -1,6 +1,6 @@
 """
-Read every .xlsx under Wireless/, take the "General Info" sheet (default header row 5),
-and write one merged workbook under output/.
+Read every .xlsx under Wireless/, take the "General Info" and "Upgrade & Change info"
+sheets (default header row 5), and write one merged workbook under output/.
 
 For "Small Cell Master Data Tracker" files, the header row is auto-detected by scanning
 from row 1: the first row where any cell matches your mapping source column titles (or
@@ -19,8 +19,12 @@ Workbooks whose name contains "Small Cell Master Data Tracker" get column aliase
 (source headers on the left of your mapping sheet -> canonical target headers on the right)
 so their values line up with other files for consolidation.
 
-The main output workbook includes a Base_headers sheet listing the common (intersection)
-column names used for the matched export, for reference.
+The main output workbook includes:
+  - "General Info" sheet with all consolidated rows from every workbook's General Info tab.
+  - "Upgrade & Change info" sheet with all consolidated rows from every workbook's
+    Upgrade & Change info tab (files missing this sheet are silently skipped).
+  - Base_headers sheet listing the common (intersection) column names used for the
+    matched export, for reference.
 """
 
 from __future__ import annotations
@@ -69,6 +73,8 @@ MASTER_COLUMN_ALIASES: list[tuple[str, str]] = [
     ),
     ("RFI Date", "RFI Date"),
 ]
+
+UPGRADE_SHEET_NAME = "Upgrade & Change info"
 
 _DUP_SUFFIX_RE = re.compile(r"__dup\d+$", re.IGNORECASE)
 
@@ -602,6 +608,170 @@ def main() -> None:
     if not loaded:
         raise SystemExit("No sheets could be read; nothing to write.")
 
+    # --- Upgrade & Change info consolidation (same approach as General Info) ---
+    upgrade_loaded: list[tuple[Path, pd.DataFrame]] = []
+    upgrade_skipped: list[tuple[str, str]] = []
+    upgrade_audit_rows: list[dict[str, object]] = []
+
+    append_log(
+        log_path,
+        f"[UPGRADE] Starting '{UPGRADE_SHEET_NAME}' consolidation across {len(paths)} file(s).",
+    )
+
+    for path in paths:
+        try:
+            rel = str(path.resolve().relative_to(input_dir.resolve()))
+        except ValueError:
+            rel = str(path)
+        try:
+            auto_hdr = should_apply_master_data_mapping(path) and not args.no_auto_header
+            df_upg, hdr_row_upg = read_general_info(
+                path,
+                UPGRADE_SHEET_NAME,
+                args.header_row,
+                auto_detect_header=auto_hdr,
+            )
+            if auto_hdr and hdr_row_upg != args.header_row:
+                append_log(
+                    log_path,
+                    f"[UPGRADE][HEADER] {path.name}: auto-detected header row {hdr_row_upg} "
+                    f"(default was {args.header_row})",
+                )
+            df_upg = normalize_dataframe_columns(df_upg)
+            df_upg = apply_master_data_column_mapping(path, df_upg)
+        except ValueError as e:
+            msg = str(e)
+            if "no sheet matching" in msg.casefold():
+                append_log(
+                    log_path,
+                    f"[UPGRADE][SKIP] {path.name}: sheet '{UPGRADE_SHEET_NAME}' not found, skipping.",
+                )
+            else:
+                append_log(
+                    log_path,
+                    f"[UPGRADE][ERROR] {path.name}: ValueError reading '{UPGRADE_SHEET_NAME}'. "
+                    f"Message={e}",
+                )
+                append_log(log_path, traceback.format_exc().rstrip())
+            upgrade_skipped.append((path.name, msg))
+            upgrade_audit_rows.append(
+                {
+                    "Relative_Path": rel,
+                    "File_Name": path.name,
+                    "Sheet": UPGRADE_SHEET_NAME,
+                    "Status": "skipped",
+                    "Rows_Read": 0,
+                    "Header_Row_Used": "",
+                    "Error": msg,
+                }
+            )
+            continue
+        except Exception as e:
+            append_log(
+                log_path,
+                f"[UPGRADE][ERROR] {path.name}: {type(e).__name__} reading "
+                f"'{UPGRADE_SHEET_NAME}'. Message={e}",
+            )
+            append_log(log_path, traceback.format_exc().rstrip())
+            upgrade_skipped.append((path.name, str(e)))
+            upgrade_audit_rows.append(
+                {
+                    "Relative_Path": rel,
+                    "File_Name": path.name,
+                    "Sheet": UPGRADE_SHEET_NAME,
+                    "Status": "skipped",
+                    "Rows_Read": 0,
+                    "Header_Row_Used": "",
+                    "Error": f"{type(e).__name__}: {e}",
+                }
+            )
+            continue
+
+        upgrade_loaded.append((path, df_upg))
+        upgrade_audit_rows.append(
+            {
+                "Relative_Path": rel,
+                "File_Name": path.name,
+                "Sheet": UPGRADE_SHEET_NAME,
+                "Status": "loaded",
+                "Rows_Read": len(df_upg),
+                "Header_Row_Used": hdr_row_upg,
+                "Error": "",
+            }
+        )
+
+    if upgrade_skipped:
+        print(f"Skipped files for '{UPGRADE_SHEET_NAME}':")
+        for name, reason in upgrade_skipped:
+            print(f"  - {name}: {reason}")
+
+    # Build merged Upgrade & Change info frames
+    if upgrade_loaded:
+        upg_all_frames: list[pd.DataFrame] = []
+        for path, df_upg in upgrade_loaded:
+            upg_df = df_upg.copy()
+            if not args.no_source_column:
+                upg_df = insert_source_column(upg_df, path)
+            upg_all_frames.append(upg_df)
+        merged_upgrade_all = pd.concat(upg_all_frames, ignore_index=True, sort=False)
+        data_cols = [c for c in merged_upgrade_all.columns if c != SOURCE_COLUMN]
+        merged_upgrade_all = merged_upgrade_all.dropna(subset=data_cols, how="all")
+        merged_upgrade_all = merged_upgrade_all[
+            ~merged_upgrade_all[data_cols].apply(
+                lambda row: all(
+                    (isinstance(v, str) and not v.strip()) or pd.isna(v)
+                    for v in row
+                ),
+                axis=1,
+            )
+        ].reset_index(drop=True)
+
+        upg_first_columns = list(upgrade_loaded[0][1].columns)
+        upg_common = set(upg_first_columns)
+        for _path, df_upg in upgrade_loaded[1:]:
+            upg_common &= set(df_upg.columns)
+        upg_base_columns = [c for c in upg_first_columns if c in upg_common]
+
+        if not upg_base_columns:
+            append_log(
+                log_path,
+                f"[UPGRADE][SCHEMA] No common headers across {len(upgrade_loaded)} "
+                f"'{UPGRADE_SHEET_NAME}' sheets; full merge only.",
+            )
+            merged_upgrade_common = pd.DataFrame()
+        else:
+            append_log(
+                log_path,
+                f"[UPGRADE][SCHEMA] Using {len(upg_base_columns)} common column(s) across "
+                f"{len(upgrade_loaded)} '{UPGRADE_SHEET_NAME}' sheet(s).",
+            )
+            upg_frames: list[pd.DataFrame] = []
+            for path, df_upg in upgrade_loaded:
+                df_sel = df_upg[upg_base_columns].copy()
+                if not args.no_source_column:
+                    df_sel = insert_source_column(df_sel, path)
+                upg_frames.append(df_sel)
+            merged_upgrade_common = pd.concat(upg_frames, ignore_index=True, sort=False)
+            upg_common_data_cols = [c for c in merged_upgrade_common.columns if c != SOURCE_COLUMN]
+            merged_upgrade_common = merged_upgrade_common.dropna(subset=upg_common_data_cols, how="all")
+            merged_upgrade_common = merged_upgrade_common[
+                ~merged_upgrade_common[upg_common_data_cols].apply(
+                    lambda row: all(
+                        (isinstance(v, str) and not v.strip()) or pd.isna(v)
+                        for v in row
+                    ),
+                    axis=1,
+                )
+            ].reset_index(drop=True)
+    else:
+        merged_upgrade_all = pd.DataFrame()
+        merged_upgrade_common = pd.DataFrame()
+        upg_base_columns = []
+        append_log(
+            log_path,
+            f"[UPGRADE] No workbooks had a readable '{UPGRADE_SHEET_NAME}' sheet.",
+        )
+
     all_frames: list[pd.DataFrame] = []
     for path, df in loaded:
         all_df = df.copy()
@@ -652,7 +822,7 @@ def main() -> None:
                 f"Cannot replace output file (close it in Excel if open): {output_path}"
             ) from None
 
-    if base_columns and matched_output_path.is_file():
+    if (base_columns or upg_base_columns) and matched_output_path.is_file():
         try:
             matched_output_path.unlink()
         except PermissionError:
@@ -661,6 +831,7 @@ def main() -> None:
             ) from None
 
     audit_df = pd.DataFrame(audit_rows)
+    upgrade_audit_df = pd.DataFrame(upgrade_audit_rows) if upgrade_audit_rows else pd.DataFrame()
     if not args.no_source_column and SOURCE_COLUMN in merged_all.columns:
         src_summary = (
             merged_all.groupby(SOURCE_COLUMN, dropna=False)
@@ -711,24 +882,46 @@ def main() -> None:
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         merged_all.to_excel(writer, sheet_name="General Info", index=False)
+        if not merged_upgrade_all.empty:
+            merged_upgrade_all.to_excel(
+                writer, sheet_name=UPGRADE_SHEET_NAME, index=False,
+            )
         audit_df.to_excel(writer, sheet_name="Consolidation_audit", index=False)
+        if not upgrade_audit_df.empty:
+            upgrade_audit_df.to_excel(
+                writer, sheet_name="Upgrade_audit", index=False,
+            )
         src_summary.to_excel(writer, sheet_name="Source_File_summary", index=False)
         schema_note.to_excel(writer, sheet_name="Schema_note", index=False)
         base_headers_df.to_excel(writer, sheet_name="Base_headers", index=False)
 
-    if base_columns:
+    write_matched = base_columns or upg_base_columns
+    if write_matched:
         with pd.ExcelWriter(matched_output_path, engine="openpyxl") as writer:
-            merged.to_excel(writer, sheet_name="General Info", index=False)
+            if base_columns:
+                merged.to_excel(writer, sheet_name="General Info", index=False)
+            if upg_base_columns and not merged_upgrade_common.empty:
+                merged_upgrade_common.to_excel(
+                    writer, sheet_name=UPGRADE_SHEET_NAME, index=False,
+                )
     else:
         append_log(
             log_path,
-            f"[SKIP] Matched columns file not written (no common headers): "
+            f"[SKIP] Matched columns file not written (no common headers for either sheet): "
             f"{matched_output_path.resolve()}",
         )
 
     print(
-        f"Wrote {len(merged_all)} rows from {len(loaded)} file(s) -> {output_path.resolve()}"
+        f"Wrote {len(merged_all)} rows from {len(loaded)} file(s) "
+        f"(General Info) -> {output_path.resolve()}"
     )
+    if not merged_upgrade_all.empty:
+        print(
+            f"Wrote {len(merged_upgrade_all)} rows from {len(upgrade_loaded)} file(s) "
+            f"('{UPGRADE_SHEET_NAME}') -> {output_path.resolve()}"
+        )
+    elif not upgrade_loaded:
+        print(f"No workbooks had a readable '{UPGRADE_SHEET_NAME}' sheet.")
     if not src_summary.empty:
         print(
             "Rows per Source_File (also in sheet 'Source_File_summary'): "
@@ -737,10 +930,19 @@ def main() -> None:
                 for _, r in src_summary.iterrows()
             )
         )
-    if base_columns:
+    if write_matched:
+        parts: list[str] = []
+        if base_columns:
+            parts.append(
+                f"General Info: {len(merged)} rows, {len(base_columns)} common column(s)"
+            )
+        if upg_base_columns and not merged_upgrade_common.empty:
+            parts.append(
+                f"{UPGRADE_SHEET_NAME}: {len(merged_upgrade_common)} rows, "
+                f"{len(upg_base_columns)} common column(s)"
+            )
         print(
-            f"Wrote {len(merged)} rows with {len(base_columns)} common matched column(s) "
-            f"-> {matched_output_path.resolve()}"
+            f"Wrote matched columns -> {matched_output_path.resolve()}  [{'; '.join(parts)}]"
         )
     else:
         print(
@@ -750,13 +952,18 @@ def main() -> None:
     append_log(
         log_path,
         f"[OK] Wrote full consolidated file -> {output_path.resolve()} "
-        f"(rows={len(merged_all)} files={len(loaded)})",
+        f"(General Info rows={len(merged_all)} files={len(loaded)})",
     )
-    if base_columns:
+    if not merged_upgrade_all.empty:
         append_log(
             log_path,
-            f"[OK] Wrote common matched columns file -> {matched_output_path.resolve()} "
-            f"(rows={len(merged)} common_columns={len(base_columns)})",
+            f"[OK] '{UPGRADE_SHEET_NAME}' sheet -> {output_path.resolve()} "
+            f"(rows={len(merged_upgrade_all)} files={len(upgrade_loaded)})",
+        )
+    if write_matched:
+        append_log(
+            log_path,
+            f"[OK] Wrote common matched columns file -> {matched_output_path.resolve()}",
         )
 
 
