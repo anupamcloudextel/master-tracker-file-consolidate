@@ -74,6 +74,19 @@ MASTER_COLUMN_ALIASES: list[tuple[str, str]] = [
     ("RFI Date", "RFI Date"),
 ]
 
+GLOBAL_COLUMN_ALIASES: list[tuple[str, str]] = [
+    (
+        "Site Off-air Date (last date for billing purpose)",
+        "Site Off-air Date (Last date for billing to Customer)",
+    ),
+    (
+        "Site Off-air Date (last date for billing)",
+        "Site Off-air Date (Last date for billing to Customer)",
+    ),
+    ("RFS", "RFS Date"),
+    ("RFI", "RFI Date"),
+]
+
 UPGRADE_SHEET_NAME = "Upgrade & Change info"
 
 _DUP_SUFFIX_RE = re.compile(r"__dup\d+$", re.IGNORECASE)
@@ -97,6 +110,52 @@ def find_columns_matching_source(df: pd.DataFrame, source_raw: str) -> list[str]
         if normalize_header(base) == want:
             found.append(str(c))
     return found
+
+
+def apply_global_column_mapping(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename / merge column variants that appear across ANY workbook
+    (not limited to Small Cell Master Data Tracker files).
+    """
+    if not GLOBAL_COLUMN_ALIASES:
+        return df
+
+    out = df.copy()
+    by_target: dict[str, list[str]] = defaultdict(list)
+    for src_raw, tgt_raw in GLOBAL_COLUMN_ALIASES:
+        tgt_norm = normalize_header(tgt_raw)
+        if normalize_header(src_raw) == tgt_norm:
+            continue
+        by_target[tgt_norm].append(src_raw)
+
+    for tgt_norm, src_raw_list in by_target.items():
+        source_col_labels: list[str] = []
+        for src_raw in src_raw_list:
+            source_col_labels.extend(find_columns_matching_source(out, src_raw))
+        seen: set[str] = set()
+        unique_sources = []
+        for c in source_col_labels:
+            if c not in seen:
+                seen.add(c)
+                unique_sources.append(c)
+
+        if not unique_sources:
+            continue
+
+        merged_from_sources = out[unique_sources[0]]
+        for c in unique_sources[1:]:
+            merged_from_sources = merged_from_sources.combine_first(out[c])
+
+        if tgt_norm in out.columns:
+            combined = out[tgt_norm].combine_first(merged_from_sources)
+            drop_cols = [c for c in unique_sources if c != tgt_norm]
+            out = out.drop(columns=drop_cols, errors="ignore")
+            out[tgt_norm] = combined
+        else:
+            out = out.drop(columns=unique_sources)
+            out[tgt_norm] = merged_from_sources
+
+    return out
 
 
 def apply_master_data_column_mapping(path: Path, df: pd.DataFrame) -> pd.DataFrame:
@@ -177,7 +236,7 @@ def resolve_sheet_name(path: Path, requested: str) -> str:
 
 
 def normalize_header(name: object) -> str:
-    s = str(name).replace("\r\n", "\n").replace("\r", "\n")
+    s = str(name).replace("_x000D_", " ").replace("\r\n", "\n").replace("\r", "\n")
     return " ".join(s.split()).strip()
 
 
@@ -366,6 +425,66 @@ def normalize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def merge_casefold_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge columns whose names differ only in case (e.g. 'Last date' vs 'last date').
+    The first occurrence's casing is kept; values from later columns fill NaN gaps.
+    """
+    groups: dict[str, list[str]] = {}
+    for col in df.columns:
+        cf = col.casefold()
+        groups.setdefault(cf, []).append(col)
+
+    to_merge = {cf: cols for cf, cols in groups.items() if len(cols) > 1}
+    if not to_merge:
+        return df
+
+    out = df.copy()
+    for _cf, cols in to_merge.items():
+        canonical = cols[0]
+        merged = out[canonical].copy()
+        for c in cols[1:]:
+            merged = merged.combine_first(out[c])
+            out = out.drop(columns=[c])
+        out[canonical] = merged
+    return out
+
+
+def canonicalize_columns_across_frames(
+    loaded: list[tuple[Path, pd.DataFrame]],
+    log_path: Path | None = None,
+) -> list[tuple[Path, pd.DataFrame]]:
+    """
+    Rename columns so that names differing only in case use the same canonical
+    spelling (first-seen casing wins).  This ensures set intersection and concat
+    treat e.g. 'Last date' and 'last date' as the same column.
+    """
+    canonical: dict[str, str] = {}
+    for _path, df in loaded:
+        for col in df.columns:
+            cf = col.casefold()
+            if cf not in canonical:
+                canonical[cf] = col
+
+    result: list[tuple[Path, pd.DataFrame]] = []
+    for path, df in loaded:
+        rename_map: dict[str, str] = {}
+        for col in df.columns:
+            cf = col.casefold()
+            if canonical[cf] != col:
+                rename_map[col] = canonical[cf]
+        if rename_map:
+            if log_path:
+                for old, new in rename_map.items():
+                    append_log(
+                        log_path,
+                        f"[CASE-MERGE] {path.name}: column {old!r} -> {new!r}",
+                    )
+            df = df.rename(columns=rename_map)
+        result.append((path, df))
+    return result
+
+
 SOURCE_COLUMN = "Source_File"
 
 
@@ -547,6 +666,7 @@ def main() -> None:
                     f"(default was {args.header_row})",
                 )
             df = normalize_dataframe_columns(df)
+            df = apply_global_column_mapping(df)
             df = apply_master_data_column_mapping(path, df)
         except ValueError as e:
             append_log(
@@ -608,6 +728,13 @@ def main() -> None:
     if not loaded:
         raise SystemExit("No sheets could be read; nothing to write.")
 
+    # Merge columns that differ only in case within each file, then
+    # canonicalize names across all files so intersection/concat aligns them.
+    loaded = [
+        (path, merge_casefold_duplicate_columns(df)) for path, df in loaded
+    ]
+    loaded = canonicalize_columns_across_frames(loaded, log_path)
+
     # --- Upgrade & Change info consolidation (same approach as General Info) ---
     upgrade_loaded: list[tuple[Path, pd.DataFrame]] = []
     upgrade_skipped: list[tuple[str, str]] = []
@@ -638,6 +765,7 @@ def main() -> None:
                     f"(default was {args.header_row})",
                 )
             df_upg = normalize_dataframe_columns(df_upg)
+            df_upg = apply_global_column_mapping(df_upg)
             df_upg = apply_master_data_column_mapping(path, df_upg)
         except ValueError as e:
             msg = str(e)
@@ -704,6 +832,13 @@ def main() -> None:
         print(f"Skipped files for '{UPGRADE_SHEET_NAME}':")
         for name, reason in upgrade_skipped:
             print(f"  - {name}: {reason}")
+
+    if upgrade_loaded:
+        upgrade_loaded = [
+            (path, merge_casefold_duplicate_columns(df))
+            for path, df in upgrade_loaded
+        ]
+        upgrade_loaded = canonicalize_columns_across_frames(upgrade_loaded, log_path)
 
     # Build merged Upgrade & Change info frames
     if upgrade_loaded:
